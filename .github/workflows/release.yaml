@@ -24,8 +24,8 @@ jobs:
         run: |
           mkdir dist
           tar -C target/release \
-            -czf dist/mytool-${GITHUB_REF_NAME}-x86_64-linux-gnu.tar.gz \
-            mytool
+            -czf dist/kctx-${GITHUB_REF_NAME}-x86_64-linux-gnu.tar.gz \
+            kctx
 
       - uses: actions/upload-artifact@v4
         with:
