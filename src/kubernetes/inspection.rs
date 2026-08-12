@@ -13,14 +13,13 @@ use std::time::{Duration, Instant};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
-use kube::Client;
 use serde::Serialize;
 
+use super::client::Connection;
 use super::health::{
     CronJobStats, DaemonSetStats, JobStats, NamespaceSummary, NodeSummary, Observation, PodStats,
     ReplicaStats, Severity,
 };
-use super::read::ReadOnly;
 use super::{ConnectionState, InspectError, classify, client, health};
 use crate::kubeconfig::{AuthMethod, ContextEntry};
 
@@ -221,18 +220,17 @@ async fn gather(
     snapshot: &mut Inspection,
 ) -> Result<(), InspectError> {
     let connection = client::connect(entry, timeouts).await?;
-    snapshot.server = Some(connection.server);
+    snapshot.server = Some(connection.server.clone());
     // Without an override, the namespace `kube` resolved for the context is authoritative.
     if namespace_override.is_none() {
-        snapshot.namespace = connection.namespace;
+        snapshot.namespace = connection.namespace.clone();
     }
     let namespace = snapshot.namespace.clone();
     let namespace = namespace.as_str();
-    let client = connection.client;
 
     // `/version` doubles as the reachability probe and the latency sample.
     let started = Instant::now();
-    match client.apiserver_version().await {
+    match connection.server_version().await {
         Ok(info) => {
             snapshot.latency = Some(started.elapsed());
             snapshot.version = Availability::Ok(ServerVersion {
@@ -255,14 +253,14 @@ async fn gather(
     // Every remaining read runs concurrently: one slow or forbidden section cannot hold up
     // the others.
     let (nodes, namespace_status, pods, deployments, statefulsets, daemonsets, jobs, cronjobs) = tokio::join!(
-        read_nodes(&client),
-        read_namespace(&client, namespace),
-        read_pods(&client, namespace),
-        read_deployments(&client, namespace),
-        read_statefulsets(&client, namespace),
-        read_daemonsets(&client, namespace),
-        read_jobs(&client, namespace),
-        read_cronjobs(&client, namespace),
+        read_nodes(&connection),
+        read_namespace(&connection, namespace),
+        read_pods(&connection, namespace),
+        read_deployments(&connection, namespace),
+        read_statefulsets(&connection, namespace),
+        read_daemonsets(&connection, namespace),
+        read_jobs(&connection, namespace),
+        read_cronjobs(&connection, namespace),
     );
 
     let observations = &mut snapshot.observations;
@@ -297,11 +295,8 @@ fn collect<T>(
 }
 
 /// Cluster nodes, if the credentials may list them.
-async fn read_nodes(client: &Client) -> Availability<(NodeSummary, Vec<Observation>)> {
-    match ReadOnly::<Node>::cluster(client.clone())
-        .list(LIST_LIMIT)
-        .await
-    {
+async fn read_nodes(connection: &Connection) -> Availability<(NodeSummary, Vec<Observation>)> {
+    match connection.cluster::<Node>().list(LIST_LIMIT).await {
         Ok(listing) => Availability::Ok(health::observe_nodes(&listing.items, listing.truncated)),
         Err(error) => Availability::from_error(&error),
     }
@@ -309,21 +304,22 @@ async fn read_nodes(client: &Client) -> Availability<(NodeSummary, Vec<Observati
 
 /// The inspected namespace object itself.
 async fn read_namespace(
-    client: &Client,
+    connection: &Connection,
     namespace: &str,
 ) -> Availability<(NamespaceSummary, Vec<Observation>)> {
-    match ReadOnly::<Namespace>::cluster(client.clone())
-        .get(namespace)
-        .await
-    {
+    match connection.cluster::<Namespace>().get(namespace).await {
         Ok(object) => Availability::Ok(health::observe_namespace(&object)),
         Err(error) => Availability::from_error(&error),
     }
 }
 
 /// Pods in the inspected namespace.
-async fn read_pods(client: &Client, namespace: &str) -> Availability<(PodStats, Vec<Observation>)> {
-    match ReadOnly::<Pod>::namespaced(client.clone(), namespace)
+async fn read_pods(
+    connection: &Connection,
+    namespace: &str,
+) -> Availability<(PodStats, Vec<Observation>)> {
+    match connection
+        .namespaced::<Pod>(namespace)
         .list(LIST_LIMIT)
         .await
     {
@@ -334,10 +330,11 @@ async fn read_pods(client: &Client, namespace: &str) -> Availability<(PodStats, 
 
 /// Deployments in the inspected namespace.
 async fn read_deployments(
-    client: &Client,
+    connection: &Connection,
     namespace: &str,
 ) -> Availability<(ReplicaStats, Vec<Observation>)> {
-    match ReadOnly::<Deployment>::namespaced(client.clone(), namespace)
+    match connection
+        .namespaced::<Deployment>(namespace)
         .list(LIST_LIMIT)
         .await
     {
@@ -351,10 +348,11 @@ async fn read_deployments(
 
 /// StatefulSets in the inspected namespace.
 async fn read_statefulsets(
-    client: &Client,
+    connection: &Connection,
     namespace: &str,
 ) -> Availability<(ReplicaStats, Vec<Observation>)> {
-    match ReadOnly::<StatefulSet>::namespaced(client.clone(), namespace)
+    match connection
+        .namespaced::<StatefulSet>(namespace)
         .list(LIST_LIMIT)
         .await
     {
@@ -368,10 +366,11 @@ async fn read_statefulsets(
 
 /// DaemonSets in the inspected namespace.
 async fn read_daemonsets(
-    client: &Client,
+    connection: &Connection,
     namespace: &str,
 ) -> Availability<(DaemonSetStats, Vec<Observation>)> {
-    match ReadOnly::<DaemonSet>::namespaced(client.clone(), namespace)
+    match connection
+        .namespaced::<DaemonSet>(namespace)
         .list(LIST_LIMIT)
         .await
     {
@@ -384,8 +383,12 @@ async fn read_daemonsets(
 }
 
 /// Jobs in the inspected namespace.
-async fn read_jobs(client: &Client, namespace: &str) -> Availability<(JobStats, Vec<Observation>)> {
-    match ReadOnly::<Job>::namespaced(client.clone(), namespace)
+async fn read_jobs(
+    connection: &Connection,
+    namespace: &str,
+) -> Availability<(JobStats, Vec<Observation>)> {
+    match connection
+        .namespaced::<Job>(namespace)
         .list(LIST_LIMIT)
         .await
     {
@@ -396,10 +399,11 @@ async fn read_jobs(client: &Client, namespace: &str) -> Availability<(JobStats, 
 
 /// CronJobs in the inspected namespace.
 async fn read_cronjobs(
-    client: &Client,
+    connection: &Connection,
     namespace: &str,
 ) -> Availability<(CronJobStats, Vec<Observation>)> {
-    match ReadOnly::<CronJob>::namespaced(client.clone(), namespace)
+    match connection
+        .namespaced::<CronJob>(namespace)
         .list(LIST_LIMIT)
         .await
     {

@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 /// The single module allowed to touch `kube::Api`.
 const GATEWAY: &str = "kubernetes/read.rs";
 
+/// The only module that may hold a `kube::Client`, and the only one that builds one.
+const CONNECTION: &str = "kubernetes/client.rs";
+
 /// API methods the gateway may call on the wrapped handle.
 const ALLOWED_API_METHODS: &[&str] = &["get", "list"];
 
@@ -152,4 +155,57 @@ fn the_gateway_keeps_its_handle_private() {
         contents.contains("    api: Api<K>,"),
         "the wrapped handle must stay a private field, or callers could reach mutating methods"
     );
+}
+
+/// True when `line` uses `Client` as a whole word rather than as part of a longer name.
+///
+/// `AuthMethod::ClientCertificate` is a perfectly innocent thing to mention anywhere, so a plain
+/// substring search would cry wolf over the kubeconfig model.
+fn names_the_client_type(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let is_boundary =
+        |byte: Option<&u8>| byte.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
+
+    line.match_indices("Client").any(|(start, marker)| {
+        is_boundary(start.checked_sub(1).and_then(|index| bytes.get(index)))
+            && is_boundary(bytes.get(start + marker.len()))
+    })
+}
+
+/// The gateway only helps if the raw client cannot be borrowed around it.
+///
+/// `kube::Client` carries `request`, `request_text` and friends, which answer any verb at all and
+/// would never touch [`ReadOnly`]. Keeping `Connection`'s client private is what makes those
+/// unreachable, so a `pub` on that field would quietly undo the guarantee the other tests protect.
+#[test]
+fn no_module_can_borrow_the_raw_client() {
+    let (_, contents) = sources()
+        .into_iter()
+        .find(|(path, _)| path.to_string_lossy() == CONNECTION)
+        .expect("the connection module must exist");
+    let code = code_only(&contents);
+
+    assert!(
+        code.contains("    client: Client,"),
+        "the client must stay a private field of Connection"
+    );
+    assert!(
+        !code.contains("pub client"),
+        "exposing the client would put the raw request methods back within reach"
+    );
+
+    for (path, contents) in sources() {
+        let name = path.to_string_lossy().to_string();
+        if name == CONNECTION || name == GATEWAY {
+            continue;
+        }
+        for (number, line) in code_only(&contents).lines().enumerate() {
+            assert!(
+                !names_the_client_type(line),
+                "{}:{} names kube::Client outside {CONNECTION} and {GATEWAY}",
+                name,
+                number + 1
+            );
+        }
+    }
 }

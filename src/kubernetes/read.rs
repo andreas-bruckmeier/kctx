@@ -5,6 +5,10 @@
 //! reach `create`, `replace`, `patch`, `delete` or `delete_collection` — introducing a mutation
 //! would mean editing this file, which is small enough to review at a glance.
 //!
+//! The constructors take a `kube::Client` and so are limited to this module's parent, because
+//! `super::client::Connection` keeps the crate's only client private. Nothing outside these two
+//! files can hold a client, which rules out the raw `request` methods as well.
+//!
 //! `tests/readonly_guard.rs` enforces the same invariant mechanically.
 
 use std::fmt::Debug;
@@ -37,7 +41,9 @@ where
     K::DynamicType: Default,
 {
     /// Read this kind within a single namespace.
-    pub fn namespaced(client: Client, namespace: &str) -> Self {
+    ///
+    /// Reachable only from [`super::client`], which owns the sole `kube::Client` in the crate.
+    pub(in crate::kubernetes) fn namespaced(client: Client, namespace: &str) -> Self {
         Self {
             api: Api::namespaced(client, namespace),
         }
@@ -50,7 +56,9 @@ where
     K::DynamicType: Default,
 {
     /// Read this cluster-scoped kind.
-    pub fn cluster(client: Client) -> Self {
+    ///
+    /// Reachable only from [`super::client`], which owns the sole `kube::Client` in the crate.
+    pub(in crate::kubernetes) fn cluster(client: Client) -> Self {
         Self {
             api: Api::all(client),
         }

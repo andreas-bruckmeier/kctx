@@ -14,6 +14,8 @@
 //! selected context wins while every cluster, user and credential keeps being read from the
 //! user's untouched original file. No credential is ever copied.
 
+use std::fs::File;
+use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -91,36 +93,146 @@ fn overlay_document(context: &str) -> String {
     )
 }
 
+/// How many names we try before giving up on finding an unused temporary one.
+const TEMPORARY_ATTEMPTS: usize = 16;
+
 /// Write the overlay unless an identical file is already there.
 fn write_overlay(path: &Path, context: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     let document = overlay_document(context);
-    if std::fs::read_to_string(path).is_ok_and(|existing| existing == document) {
+    let dir = path
+        .parent()
+        .context("overlay path has no parent directory")?;
+    // Checked before anything so much as reads `path`, so the shortcut below cannot be aimed
+    // somewhere else by a cache directory we should never have trusted.
+    paths::ensure_private_dir(dir)?;
+
+    if is_current(path, &document) {
         tracing::debug!(path = %path.display(), "overlay already current");
         return Ok(());
     }
 
-    let dir = path
-        .parent()
-        .context("overlay path has no parent directory")?;
-    paths::ensure_private_dir(dir)?;
-
     // Write-then-rename so a concurrent reader never sees a half-written document.
-    let temporary = path.with_extension(format!("tmp{}", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    file.write_all(document.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&temporary, path)?;
+    let mut temporary = TempOverlay::create(dir, path)?;
+    temporary.write(document.as_bytes())?;
+    temporary.commit(path)?;
 
     tracing::debug!(path = %path.display(), "overlay written");
     Ok(())
+}
+
+/// True when `path` is already a private, regular file holding exactly `document`.
+///
+/// The metadata matters as much as the contents. kctx prints this path as the *first* entry of a
+/// `KUBECONFIG` list, and merging reads clusters and users from every entry — so a symbolic link
+/// here would splice a file kctx does not control into the user's configuration, which is a good
+/// deal worse than a stale overlay. Anything unexpected therefore falls through to the write in
+/// [`write_overlay`], which replaces the directory entry instead of following it.
+fn is_current(path: &Path, document: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.mode() & 0o177 != 0 {
+        return false;
+    }
+    std::fs::read_to_string(path).is_ok_and(|existing| existing == document)
+}
+
+/// Create `path` for writing, failing if anything already exists there.
+///
+/// `create_new` is `O_CREAT | O_EXCL`, and that is what makes this safe: a name somebody else got
+/// to first — including a symbolic link planted in a shared cache directory — makes the open fail
+/// rather than being followed and truncated. Because the file is always brand new, `mode` is never
+/// the no-op it would be on an existing file.
+fn open_new_private(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// A hard-to-guess suffix for temporary names, without pulling in a random number generator.
+///
+/// `RandomState` is seeded by the operating system, so values differ between runs and between
+/// concurrent shells. This only stops a squatter turning [`open_new_private`] into a denial of
+/// service by pre-creating the name; the exclusive create is what keeps it *safe*.
+fn random_suffix() -> u64 {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.finish()
+}
+
+/// A uniquely named temporary file that deletes itself again unless it is committed.
+struct TempOverlay {
+    path: Option<PathBuf>,
+    file: Option<File>,
+}
+
+impl TempOverlay {
+    /// Create a fresh temporary file beside `target`.
+    ///
+    /// `paths::encode_file_stem` never produces a leading dot and [`overlay_path`] only ever emits
+    /// `*.yaml`, so a `*.tmp` name can never collide with a real overlay.
+    fn create(dir: &Path, target: &Path) -> anyhow::Result<Self> {
+        let stem = target
+            .file_stem()
+            .context("overlay path has no file name")?
+            .to_string_lossy()
+            .into_owned();
+
+        for _ in 0..TEMPORARY_ATTEMPTS {
+            let suffix = random_suffix();
+            let path = dir.join(format!("{stem}.{suffix:016x}.tmp"));
+            match open_new_private(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path: Some(path),
+                        file: Some(file),
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::bail!("could not create a temporary file in {}", dir.display())
+    }
+
+    /// Write the whole document and flush it to disk.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let file = self
+            .file
+            .as_mut()
+            .expect("a temporary file is written once");
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+
+    /// Move the finished file into place, disarming the cleanup in [`Drop`].
+    fn commit(mut self, target: &Path) -> io::Result<()> {
+        self.file.take();
+        let path = self
+            .path
+            .take()
+            .expect("a temporary file is committed once");
+        // `rename` replaces the directory entry itself and never follows a symbolic link at the
+        // destination, so a hostile overlay path is unlinked rather than written through.
+        std::fs::rename(&path, target)
+    }
+}
+
+impl Drop for TempOverlay {
+    fn drop(&mut self) {
+        self.file.take();
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +242,18 @@ mod tests {
     use kube::config::Kubeconfig;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// The overlay directory as production sees it: a path *below* the cache root, which
+    /// `prepare_in` creates itself at `0700`.
+    ///
+    /// Handing a test's temporary directory straight to `prepare_in` would not do, because
+    /// `tempfile` leaves it at whatever the umask allows — usually `0755` — and
+    /// [`paths::ensure_private_dir`] rightly refuses to keep overlays somewhere other users can
+    /// read.
+    fn overlay_dir(root: &TempDir) -> PathBuf {
+        root.path().join("contexts")
+    }
 
     fn entry(name: &str, source: &Path, current_in_source: bool) -> ContextEntry {
         ContextEntry {
@@ -149,11 +273,12 @@ mod tests {
 
     #[test]
     fn prepends_an_overlay_when_the_source_selects_another_context() {
-        let dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
         let source = Path::new("/home/u/.kube/prod.yaml");
 
-        let selection = prepare_in(&entry("production-eu", source, false), dir.path()).unwrap();
-        let overlay = dir.path().join("production-eu.yaml");
+        let selection = prepare_in(&entry("production-eu", source, false), &dir).unwrap();
+        let overlay = dir.join("production-eu.yaml");
 
         assert_eq!(
             selection.kubeconfig,
@@ -165,22 +290,34 @@ mod tests {
 
     #[test]
     fn writes_nothing_when_the_source_already_selects_the_context() {
-        let dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
         let source = Path::new("/home/u/.kube/prod.yaml");
 
-        let selection = prepare_in(&entry("production-eu", source, true), dir.path()).unwrap();
+        let selection = prepare_in(&entry("production-eu", source, true), &dir).unwrap();
 
         assert_eq!(selection.kubeconfig, source.display().to_string());
         assert_eq!(selection.overlay, None);
-        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        assert!(!dir.exists(), "the cache was touched for nothing");
+    }
+
+    #[test]
+    fn the_overlay_directory_is_created_private() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
+        prepare_in(&entry("prod", Path::new("/k/c.yaml"), false), &dir).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "unexpected mode {:o}", mode & 0o777);
     }
 
     #[test]
     fn overlay_contains_only_a_context_name() {
-        let dir = tempfile::tempdir().unwrap();
-        prepare_in(&entry("prod", Path::new("/k/c.yaml"), false), dir.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
+        prepare_in(&entry("prod", Path::new("/k/c.yaml"), false), &dir).unwrap();
 
-        let written = std::fs::read_to_string(dir.path().join("prod.yaml")).unwrap();
+        let written = std::fs::read_to_string(dir.join("prod.yaml")).unwrap();
         assert!(written.contains("current-context: \"prod\""), "{written}");
         for forbidden in [
             "token",
@@ -195,10 +332,11 @@ mod tests {
 
     #[test]
     fn overlay_is_only_readable_by_its_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        prepare_in(&entry("prod", Path::new("/k/c.yaml"), false), dir.path()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
+        prepare_in(&entry("prod", Path::new("/k/c.yaml"), false), &dir).unwrap();
 
-        let mode = std::fs::metadata(dir.path().join("prod.yaml"))
+        let mode = std::fs::metadata(dir.join("prod.yaml"))
             .unwrap()
             .permissions()
             .mode();
@@ -207,41 +345,35 @@ mod tests {
 
     #[test]
     fn repeated_selection_is_idempotent_and_leaves_no_temporary_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
         let entry = entry("prod", Path::new("/k/c.yaml"), false);
 
-        let first = prepare_in(&entry, dir.path()).unwrap();
-        let second = prepare_in(&entry, dir.path()).unwrap();
+        let first = prepare_in(&entry, &dir).unwrap();
+        let second = prepare_in(&entry, &dir).unwrap();
 
         assert_eq!(first, second);
-        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
         assert_eq!(files.len(), 1, "{files:?}");
     }
 
     #[test]
     fn different_contexts_never_share_an_overlay_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let one = prepare_in(
-            &entry("team a/prod", Path::new("/k/c.yaml"), false),
-            dir.path(),
-        )
-        .unwrap();
-        let two = prepare_in(
-            &entry("team a_2fprod", Path::new("/k/c.yaml"), false),
-            dir.path(),
-        )
-        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
+        let one = prepare_in(&entry("team a/prod", Path::new("/k/c.yaml"), false), &dir).unwrap();
+        let two = prepare_in(&entry("team a_2fprod", Path::new("/k/c.yaml"), false), &dir).unwrap();
 
         assert_ne!(one.overlay, two.overlay);
     }
 
     #[test]
     fn awkward_context_names_stay_parseable() {
-        let dir = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
         let name = "arn:aws:eks:eu-central-1:1234:cluster/prod # \"quoted\"";
 
-        let selection =
-            prepare_in(&entry(name, Path::new("/k/c.yaml"), false), dir.path()).unwrap();
+        let selection = prepare_in(&entry(name, Path::new("/k/c.yaml"), false), &dir).unwrap();
         let parsed = Kubeconfig::read_from(selection.overlay.unwrap()).unwrap();
 
         assert_eq!(parsed.current_context.as_deref(), Some(name));
@@ -251,16 +383,16 @@ mod tests {
     fn overlay_plus_source_merges_to_the_selected_context() {
         // The property the whole mechanism rests on: merging the overlay ahead of the user's
         // file yields the selected context, with clusters and users coming from the original.
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("prod.yaml");
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
+        let source_path = root.path().join("prod.yaml");
         std::fs::write(
             &source_path,
             "apiVersion: v1\nkind: Config\ncurrent-context: staging\nclusters:\n  - name: c\n    cluster:\n      server: https://example.com\nusers:\n  - name: u\n    user:\n      token: secret\ncontexts:\n  - name: staging\n    context:\n      cluster: c\n      user: u\n  - name: production-eu\n    context:\n      cluster: c\n      user: u\n",
         )
         .unwrap();
 
-        let selection =
-            prepare_in(&entry("production-eu", &source_path, false), dir.path()).unwrap();
+        let selection = prepare_in(&entry("production-eu", &source_path, false), &dir).unwrap();
         let paths: Vec<&str> = selection.kubeconfig.split(':').collect();
 
         let merged = Kubeconfig::read_from(paths[0])
@@ -271,5 +403,115 @@ mod tests {
         assert_eq!(merged.current_context.as_deref(), Some("production-eu"));
         assert_eq!(merged.clusters.len(), 1);
         assert_eq!(merged.contexts.len(), 2);
+    }
+
+    #[test]
+    fn a_pre_existing_symlink_is_never_opened_or_followed() {
+        // The temporary name is random by design, so the exclusivity is tested where it lives
+        // rather than through `prepare_in`: pre-create the exact path and check the target
+        // survives untouched.
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let planted = root.path().join("prod.0123456789abcdef.tmp");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let error = open_new_private(&planted).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+    }
+
+    #[test]
+    fn a_symlinked_overlay_is_replaced_instead_of_written_through() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
+        paths::ensure_private_dir(&dir).unwrap();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let overlay = overlay_path(&dir, "prod");
+        std::os::unix::fs::symlink(&victim, &overlay).unwrap();
+
+        prepare_in(&entry("prod", Path::new("/k/c.yaml"), false), &dir).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        let metadata = std::fs::symlink_metadata(&overlay).unwrap();
+        assert!(metadata.file_type().is_file(), "the link survived");
+        assert!(
+            std::fs::read_to_string(&overlay)
+                .unwrap()
+                .contains("current-context: \"prod\"")
+        );
+    }
+
+    #[test]
+    fn a_symlinked_overlay_is_not_mistaken_for_a_current_one() {
+        // The nastier variant: the link already points at a file holding exactly the right
+        // document, so a content-only check would accept it and print an attacker's path as the
+        // first entry of `KUBECONFIG`.
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
+        paths::ensure_private_dir(&dir).unwrap();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, overlay_document("prod")).unwrap();
+        let overlay = overlay_path(&dir, "prod");
+        std::os::unix::fs::symlink(&victim, &overlay).unwrap();
+
+        prepare_in(&entry("prod", Path::new("/k/c.yaml"), false), &dir).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&overlay)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "a link holding the right bytes was accepted anyway"
+        );
+    }
+
+    #[test]
+    fn an_overlay_directory_others_can_reach_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = overlay_dir(&root);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = prepare_in(&entry("prod", Path::new("/k/c.yaml"), false), &dir).unwrap_err();
+
+        let report = format!("{error:#}");
+        assert!(report.contains("accessible to other users"), "{report}");
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert!(files.is_empty(), "a refusal still left {files:?} behind");
+    }
+
+    #[test]
+    fn an_overlay_directory_that_is_a_symlink_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let dir = overlay_dir(&root);
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+
+        let error = prepare_in(&entry("prod", Path::new("/k/c.yaml"), false), &dir).unwrap_err();
+
+        let report = format!("{error:#}");
+        assert!(report.contains("symbolic link"), "{report}");
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_cache_root_others_can_write_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = prepare_in(
+            &entry("prod", Path::new("/k/c.yaml"), false),
+            &cache.join("contexts"),
+        )
+        .unwrap_err();
+
+        let report = format!("{error:#}");
+        assert!(report.contains("writable by other users"), "{report}");
     }
 }

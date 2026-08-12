@@ -28,17 +28,93 @@ pub fn overlay_dir() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join("contexts"))
 }
 
-/// Create `dir` (and parents) with owner-only permissions.
+/// Create `dir` (and parents) with owner-only permissions, verifying what is already there.
+///
+/// A directory that already exists is *checked* rather than trusted: kctx writes the overlay files
+/// that decide which cluster a shell talks to, so a cache directory another user can modify is not
+/// a usable place to keep them.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 
-    if dir.is_dir() {
-        return Ok(());
+    if let Some(existing) = deepest_existing_ancestor(dir) {
+        check_shared_ancestor(&existing)?;
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
+
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => check_private_dir(dir, &metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir),
+        Err(error) => Err(error),
+    }
+}
+
+/// The closest ancestor of `dir` that already exists, ignoring `dir` itself.
+fn deepest_existing_ancestor(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.try_exists().unwrap_or(false))
+        .map(Path::to_path_buf)
+}
+
+/// Reject a directory kctx will create its own directories inside if others can write to it.
+///
+/// This deliberately follows symbolic links: users legitimately point `$XDG_CACHE_HOME` or
+/// `~/.cache` at another location, and what matters is the permissions of the directory the name
+/// actually resolves to.
+fn check_shared_ancestor(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(dir)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "{} is not a directory, so kctx cannot keep its cache below it",
+            dir.display()
+        )));
+    }
+
+    // Sticky directories such as `/tmp` are world-writable by design and are still safe to build
+    // inside: the sticky bit is what stops anyone but the owner removing or renaming our entries.
+    let mode = metadata.mode();
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(io::Error::other(format!(
+            "{} is writable by other users (mode {:o}); kctx will not keep its cache below it",
+            dir.display(),
+            mode & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+/// Require `dir` to be a real directory that only its owner can reach.
+fn check_private_dir(dir: &Path, metadata: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Checked before `is_dir`, which is false for a symbolic link however it resolves and would
+    // otherwise report a link to a perfectly good directory as "not a directory".
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::other(format!(
+            "{} is a symbolic link; kctx will not write overlays through one",
+            dir.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "{} exists but is not a directory",
+            dir.display()
+        )));
+    }
+
+    let mode = metadata.mode();
+    if mode & 0o077 != 0 {
+        return Err(io::Error::other(format!(
+            "{} is accessible to other users (mode {:o}); run `chmod 700` on it",
+            dir.display(),
+            mode & 0o7777
+        )));
+    }
+    Ok(())
 }
 
 /// Render a path for humans, abbreviating the home directory to `~`.

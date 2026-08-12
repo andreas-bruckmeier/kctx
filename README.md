@@ -164,11 +164,18 @@ This is a structural property, not a promise:
 - Exactly one module, `src/kubernetes/read.rs`, may construct a `kube::Api`. It wraps it in a
   `ReadOnly<K>` that exposes only `get` and `list`; the handle itself is a private field, so no
   other module *can* reach `create`, `replace`, `patch`, `delete` or `delete_collection`.
+- The `kube::Client` is private to `Connection` in `src/kubernetes/client.rs`, and only that module
+  and the gateway can name one. This closes the other half of the door: a client also carries raw
+  `request` methods that answer any verb at all and would never pass through `ReadOnly<K>`. The rest
+  of the crate is handed a `Connection`, whose entire surface is `server_version` (a `GET /version`)
+  plus the two `ReadOnly` constructors — so a raw request is not merely discouraged, there is no
+  client to call one on.
 - Authenticated identity is derived from the kubeconfig, not from a `SelfSubjectReview` — that
   API would require a `POST`.
-- `tests/readonly_guard.rs` fails the build if any source file constructs an `Api` outside that
-  module, calls anything but `get`/`list` on it, or so much as mentions `PostParams`,
-  `PatchParams`, `DeleteParams`, `Patch::`, a mutating HTTP method or the subject-review APIs.
+- `tests/readonly_guard.rs` fails the build if any source file constructs an `Api` outside the
+  gateway, calls anything but `get`/`list` on it, names `Client` outside those two modules, exposes
+  either handle as a `pub` field, or so much as mentions `PostParams`, `PatchParams`,
+  `DeleteParams`, `Patch::`, a mutating HTTP method or the subject-review APIs.
 
 Clusters are only contacted when you ask for live information: `kctx inspect`, or pressing `i` in
 the selector. Requests carry a 3 s connect and 5 s response timeout inside an 8 s overall budget
@@ -227,10 +234,22 @@ relative certificate, token and exec paths, so kctx never touches kubeconfig byt
   *auth method* (`token`, `client certificate`, `exec plugin (aws)`, …).
 - YAML parse errors are reduced to their first line, because the parser's excerpt can quote the
   line next to a credential.
-- Credential acquisition is left entirely to `kube`; kctx never spawns a process, and exec-plugin
-  failure messages are not forwarded, since they can contain plugin output.
+- Credential acquisition is left entirely to `kube`. kctx's own code never spawns a process, but
+  `kube` will run an `exec` credential plugin if the selected context configures one — that is the
+  standard Kubernetes credential-plugin contract, and it is how `aws eks get-token`,
+  `gke-gcloud-auth-plugin` and `kubelogin` authenticate for `kubectl` too. Only `kctx inspect` (and
+  `i` in the selector) builds a client, so `list`, `current` and `select` never run a plugin. Treat a
+  kubeconfig the way you would treat a shell script: anyone who can write yours, or set your
+  `$KUBECONFIG`, can already run code as you. Exec-plugin failure messages are not forwarded, since
+  they can contain plugin output.
+- Overlays live in a directory kctx creates at `0700`, as files at `0600`. A cache directory that is
+  a symbolic link, that other users can read, or that sits below a directory other users can write
+  is refused rather than used, and overlays are written to a fresh randomly named temporary file
+  opened `O_EXCL` and then renamed — so a name somebody else got in first is never followed.
 - Logging is off unless you pass `--log-file` (or set `KCTX_LOG_FILE`); filter with `--log-level`
-  or `KCTX_LOG`. Nothing is ever logged to stdout or stderr.
+  or `KCTX_LOG`. New log files are created `0600`, and a destination that is not a regular file — a
+  symbolic link, a fifo, a device — is refused, so an inherited `KCTX_LOG_FILE` cannot append
+  somewhere it was never meant to. Nothing is ever logged to stdout or stderr.
 - No telemetry, no phoning home: the only network traffic is to the API server of the context you
   asked to inspect.
 
@@ -240,12 +259,13 @@ relative certificate, token and exec paths, so kctx never touches kubeconfig byt
 cargo test
 ```
 
-137 tests, all offline: kubeconfig discovery and merge precedence, multi-context and multi-document
+148 tests, all offline: kubeconfig discovery and merge precedence, multi-context and multi-document
 parsing, duplicate context names across files, contexts without namespaces, malformed and
 non-kubeconfig files, secret redaction, overlay naming/permissions/idempotency (including a proof
-that overlay + source merges to the intended `current-context`), filter ranking, key handling, TUI
-rendering via ratatui's `TestBackend`, health analysis from JSON resource fixtures, `kube::Error`
-classification, and the read-only guard.
+that overlay + source merges to the intended `current-context`), symlink and shared-directory
+refusal for both the overlay cache and the log file, filter ranking, key handling, TUI rendering via
+ratatui's `TestBackend`, health analysis from JSON resource fixtures, `kube::Error` classification,
+and the read-only guard.
 
 End-to-end inspection is tested against a loopback stand-in for the API server
 (`src/kubernetes/fake_api.rs`), which is how the "Nodes forbidden but Pods readable" degradation

@@ -6,10 +6,13 @@
 
 use std::time::Duration;
 
+use k8s_openapi::apimachinery::pkg::version::Info;
 use kube::config::{KubeConfigOptions, Kubeconfig};
-use kube::{Client, Config};
+use kube::core::{ClusterResourceScope, NamespaceResourceScope};
+use kube::{Client, Config, Resource};
 
 use super::InspectError;
+use super::read::ReadOnly;
 use crate::kubeconfig::ContextEntry;
 
 /// Timeouts applied to every cluster interaction.
@@ -49,13 +52,46 @@ impl Timeouts {
 ///
 /// `kube::Client` deliberately hides its configuration, so the server URL and the resolved
 /// namespace are captured here while they are still available.
+///
+/// The client itself is **private**, and this module and [`super::read`] are the only two that can
+/// name one. That is what keeps kctx read-only: `kube::Client` also offers raw `request` methods
+/// that would sail straight past [`ReadOnly`], and no other module can obtain a client to call
+/// them on. The three methods below are the whole of what the rest of the crate may do with a
+/// connection.
 pub struct Connection {
-    /// The client itself.
-    pub client: Client,
+    client: Client,
     /// API server URL the client will talk to.
     pub server: String,
     /// Namespace the context resolved to.
     pub namespace: String,
+}
+
+impl Connection {
+    /// `GET /version`: the one request kctx makes outside the read-only gateway.
+    ///
+    /// It doubles as the reachability probe and the latency sample, and it is a read like any
+    /// other — it just has no resource type to hang off [`ReadOnly`].
+    pub async fn server_version(&self) -> Result<Info, kube::Error> {
+        self.client.apiserver_version().await
+    }
+
+    /// A read-only handle to a cluster-scoped kind.
+    pub fn cluster<K>(&self) -> ReadOnly<K>
+    where
+        K: Resource<Scope = ClusterResourceScope>,
+        K::DynamicType: Default,
+    {
+        ReadOnly::cluster(self.client.clone())
+    }
+
+    /// A read-only handle to a namespaced kind.
+    pub fn namespaced<K>(&self, namespace: &str) -> ReadOnly<K>
+    where
+        K: Resource<Scope = NamespaceResourceScope>,
+        K::DynamicType: Default,
+    {
+        ReadOnly::namespaced(self.client.clone(), namespace)
+    }
 }
 
 /// Build a client for `entry` from the kubeconfig file that defines it.
@@ -152,7 +188,6 @@ contexts:
 
         assert_eq!(connection.namespace, "chosen");
         assert_eq!(connection.server, "https://cluster.example.com:6443/");
-        assert_eq!(connection.client.default_namespace(), "chosen");
     }
 
     #[tokio::test]
