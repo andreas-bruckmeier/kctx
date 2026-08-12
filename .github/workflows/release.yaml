@@ -20,6 +20,9 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      - name: Strip binary
+        run: strip target/release/kctx
+
       - name: Package
         run: |
           mkdir dist
